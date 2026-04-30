@@ -426,9 +426,13 @@ class PaddleOCRApp:
                 result.append(0)  # Space
             else:
                 # Different lines - check the gap size
-                # If gap is as wide or wider than current block height, use double newline
-                if vertical_gap >= curr_height:
-                    result.append(2)  # Double newline
+                # Use double newline only when the gap is significantly larger than
+                # the current block height (e.g. between separate tweets in a thread,
+                # or between original tweet and quote-retweet comment).
+                # A gap equal to block height is just a normal paragraph break
+                # (like a blank line between paragraphs within the same tweet).
+                if vertical_gap >= curr_height * 2:
+                    result.append(2)  # Double newline (large gap = different tweet)
                 elif vertical_gap > prev_height * (line_height_ratio + 1):
                     result.append(1)  # Regular new paragraph
                 else:
@@ -703,6 +707,10 @@ class PaddleOCRApp:
             @johndoe
         -> both the nickname line and the @handle line are removed.
 
+        Also handles lines where the handle is followed by a timestamp or other
+        metadata (e.g. "JD Schooley @DirtyDog650 · 23h"):
+        -> extracts @DirtyDog650 and removes the entire line.
+
         Returns: (handles_list, cleaned_text)
         """
         if not text:
@@ -721,11 +729,21 @@ class PaddleOCRApp:
             stripped = line.strip()
 
             # Case 1: nickname and handle on the same line, e.g. "John Doe @johndoe"
-            match = re.match(r"^(.{0,20}?)@([\w.]+)$", stripped)
+            # or "JD Schooley @DirtyDog650 · 23h" (handle followed by timestamp/metadata)
+            # or "Oklahoma Department of... @OKWildlifeDept" (long display name + handle)
+            # Match: optional nickname (0-50 chars), then @handle, then optionally
+            # more text (timestamp, etc.). Using 50 chars to accommodate display names
+            # that OCR may place before @handle.
+            match = re.match(r"^(.{0,50}?)@([\w.]+)", stripped)
             if match:
+                # Check that the handle appears early enough in the line to be a
+                # poster line, not a mid-tweet mention. If there's significant text
+                # AFTER the handle that looks like tweet content (not just metadata),
+                # this might be a false positive. But for now, the 20-char nickname
+                # limit is a reasonable heuristic.
                 handle = "@" + match.group(2)
                 handles.append(handle)
-                # Remove the entire line (nickname + handle) from the body
+                # Remove the entire line (nickname + handle + any trailing text)
                 continue
 
             # Case 2: this line is just a @handle by itself
@@ -753,6 +771,84 @@ class PaddleOCRApp:
 
         return handles, "\n".join(cleaned_lines)
 
+    def strip_reply_to(self, text):
+        """
+        Remove 'Replying to @handle' prefixes from lines, keeping the rest
+        of the content. Also handles '@handle Replying to @handle' patterns
+        that appear mid-line (which indicate a separate tweet embedded in the
+        same OCR line), splitting the line at that boundary.
+        """
+        if not text:
+            return text
+        lines = text.split("\n")
+        # Pattern for "Replying to @handle" at the start of a line
+        reply_prefix_pattern = re.compile(
+            r'^(Replying\s+to\s+@[\w.]+)\s*',
+            re.IGNORECASE,
+        )
+        # Pattern for "@handle Replying to @handle" mid-line — this indicates
+        # a new tweet starts here. We split the line at this point.
+        # e.g. "...text. @OKWildlifeDept Replying to @DirtyDog650 fish is..."
+        # We capture the first @handle separately so it can be preserved as
+        # a handle line for the new tweet section.
+        mid_reply_pattern = re.compile(
+            r'(@[\w.]+)\s+Replying\s+to\s+@[\w.]+',
+            re.IGNORECASE,
+        )
+        # Pattern for trailing display name before a mid-line reply marker.
+        # OCR often places the display name right before the @handle, e.g.
+        # "...Oklahoma Department of...   @OKWildlifeDept Replying to..."
+        # This pattern matches text ending with "..." that consists only of
+        # alphabetic words (at least 2 alpha chars, no numbers), to avoid
+        # matching stat fragments like "80.4K" where "K" could be mistaken.
+        trailing_display_name = re.compile(
+            r'\s*[A-Za-z]{2,}[A-Za-z\s]*\.\.\.\s*$',
+        )
+        cleaned = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                cleaned.append(line)
+                continue
+            # Strip "Replying to @handle" prefix
+            stripped = reply_prefix_pattern.sub('', stripped)
+            stripped = stripped.strip()
+            if not stripped:
+                continue
+            # Check for mid-line "Replying to" patterns and split
+            # We split into parts: [text_before, "@handle", text_after]
+            # The captured @handle is preserved as a handle line for the
+            # new tweet section that follows.
+            parts = mid_reply_pattern.split(stripped, maxsplit=1)
+            if len(parts) >= 3:
+                # parts[0] = text before the reply marker
+                # parts[1] = the @handle of the replying account (preserved)
+                # parts[2] = text after the reply marker (new tweet content)
+                before = parts[0].strip()
+                handle = parts[1].strip()
+                after = parts[2].strip()
+
+                # If the text before the marker ends with a display name
+                # fragment (e.g. "Oklahoma Department of..."), move it to
+                # the new tweet section as it belongs to the replying account.
+                dn_match = trailing_display_name.search(before)
+                if dn_match:
+                    display_name = dn_match.group(0).strip()
+                    before = before[:dn_match.start()].strip()
+                    # Prepend the display name to the handle line
+                    handle = f"{display_name} {handle}"
+
+                if before:
+                    cleaned.append(before)
+                if handle:
+                    cleaned.append(handle)
+                if after:
+                    cleaned.append(after)
+            else:
+                # No mid-line reply found, keep as-is
+                cleaned.append(stripped)
+        return "\n".join(cleaned)
+
     def strip_timestamps(self, text):
         """Remove lines that contain Twitter-style timestamps."""
         if not text:
@@ -764,6 +860,75 @@ class PaddleOCRApp:
             if not self.has_twitter_timestamp(line.strip())
         ]
         return "\n".join(cleaned)
+
+    def strip_inline_stats(self, text):
+        """
+        Remove inline statistics and timestamp patterns that appear within
+        tweet content lines (not just on their own lines). This handles cases
+        where OCR merges stats onto the same line as tweet text.
+
+        Removes patterns like:
+        - "D3 172 1,379 ill 80.4K" (stat token sequences)
+        - "8:44 · 04 Dec 23 · 90.3K Views 42 Retweets 4 Quotes 1,567 Likes"
+          (timestamp + stats combos at end of line)
+        """
+        if not text:
+            return text
+
+        lines = text.split("\n")
+        cleaned_lines = []
+
+        # Pattern for inline timestamp+stats combos at end of line:
+        # e.g. "text 8:44 · 04 Dec 23 · 90.3K Views 42 Retweets 4 Quotes 1,567 Likes"
+        inline_timestamp_stats = re.compile(
+            r'\s*\d{1,2}:\d{2}(?::\d{2})?\s*[·\-–]\s*'
+            r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2,4}'
+            r'(?:\s*[·\-–]\s*'
+            r'[\d,.\sKkMmBbTtA-Za-z]+'
+            r'(?:Retweets?|Quotes?|Likes?|Views?|Reposts?|Replies?|Comments?|Shares?|Saves?|Bookmarks?|Impressions?|Engagements?|Followers?|Following?|Subscribers?|Liked|Reposted|Follow)?'
+            r'[\d,.\sKkMmBbTtA-Za-z]*)*'
+            r'\s*$',
+            re.IGNORECASE,
+        )
+
+        # Pattern for stat token sequences within a line:
+        # e.g. "text. D3 172 1,379 ill 80.4K more text"
+        # Matches a sequence of stat tokens: optional-letter+number, short words (1-2 chars),
+        # or pure numbers with commas. Each token in the sequence must be a stat-like token.
+        inline_stat_sequence = re.compile(
+            r'\s+'
+            r'(?:'
+            r'[A-Za-z]?\d[\d,.]*[KkMmBbTt]?'  # e.g. D3, 172, 1,379, 80.4K
+            r')'
+            r'(?:\s+(?:'
+            r'[A-Za-z]?\d[\d,.]*[KkMmBbTt]?'  # more number-like tokens
+            r'|'
+            r'[A-Za-z]{1,3}(?=\s+(?:[A-Za-z]?\d|[\d,]))'  # short word before more stats
+            r'))*'
+            r'\s*',
+        )
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                cleaned_lines.append(line)
+                continue
+
+            # First, try to strip inline timestamp+stats combo from the end
+            stripped = inline_timestamp_stats.sub('', stripped)
+
+            # Then, try to strip stat sequences from within the line
+            # We do this iteratively to handle multiple stat sequences
+            prev = None
+            while prev != stripped:
+                prev = stripped
+                stripped = inline_stat_sequence.sub(' ', stripped).strip()
+
+            stripped = stripped.strip()
+            if stripped:
+                cleaned_lines.append(stripped)
+
+        return "\n".join(cleaned_lines)
 
     def split_into_tweet_chunks(self, text, max_chars=280):
         """
@@ -822,9 +987,12 @@ class PaddleOCRApp:
         if not text:
             return text
 
-        cleaned = self.strip_timestamps(text)
-        cleaned = self.strip_statistics(cleaned)
+        cleaned = self.strip_reply_to(text)
+        # Extract handles BEFORE stripping timestamps, since the handle
+        # may be on the same line as the timestamp
         handles, cleaned = self.detect_handles(cleaned)
+        cleaned = self.strip_timestamps(cleaned)
+        cleaned = self.strip_statistics(cleaned)
         cleaned = cleaned.strip()
 
         handle_str = handles[0] if handles else "@unknown"
@@ -841,31 +1009,202 @@ class PaddleOCRApp:
         @handle2:
         > [chunk2]
         ...
+
+        Uses handle lines found in the raw text to identify individual
+        tweets in the thread. A "handle line" is a line containing an
+        @username with a short nickname prefix (e.g. "John Doe @johndoe"
+        or "JD Schooley @DirtyDog650 · 23h"). Each tweet section runs
+        from one handle line to the next handle line (or end of text).
+
+        If no handle lines are found, falls back to timestamp-based
+        splitting.
         """
         if not text:
             return text
 
-        cleaned = self.strip_timestamps(text)
-        cleaned = self.strip_statistics(cleaned)
-        handles, cleaned = self.detect_handles(cleaned)
-        cleaned = cleaned.strip()
+        # First strip "Replying to @handle" prefixes which are metadata
+        text = self.strip_reply_to(text)
 
-        chunks = self.split_into_tweet_chunks(cleaned, 280)
+        lines = text.split("\n")
 
-        if not chunks:
-            return text
+        # Strategy: find handle lines in the raw text. Each tweet in a
+        # thread screenshot starts with a handle line like:
+        #   "Oklahoma Department...· 23h"  (display name + timestamp, no @handle visible)
+        #   "JD Schooley @DirtyDog650 · 23h"  (nickname + @handle + timestamp)
+        #
+        # We use these handle lines as delimiters to split the thread
+        # into individual tweets. The text before the first handle line
+        # is treated as the first tweet (which may not have a detectable
+        # @handle in the OCR output).
 
-        lines = ["tweet thread that goes as follows", ""]
-        for i, chunk in enumerate(chunks):
-            handle = handles[i] if i < len(handles) else (
-                handles[-1] if handles else "@unknown"
-            )
-            lines.append(f"{handle}:")
-            lines.append(f"> {chunk}")
-            if i < len(chunks) - 1:
-                lines.append("")
+        # Find all handle line indices.
+        # A handle line is one that contains @username with a short
+        # nickname prefix (≤20 chars before the @).
+        handle_indices = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # Match: optional short nickname (0-50 chars), then @handle,
+            # optionally followed by more text (timestamp, etc.)
+            # Using 50 chars to accommodate display names like
+            # "Oklahoma Department of..." that OCR may place before @handle.
+            if re.match(r"^.{0,50}?@([\w.]+)", stripped):
+                handle_indices.append(i)
 
-        return "\n".join(lines)
+        if len(handle_indices) >= 1:
+            # Split the thread into individual tweets using handle lines
+            # as delimiters.
+            tweet_sections = []
+
+            # Text before the first handle line is the first tweet section
+            # (the first tweet's handle may not have been captured by OCR)
+            first_section_lines = lines[:handle_indices[0]]
+            if first_section_lines:
+                tweet_sections.append(first_section_lines)
+
+            # Each handle line starts a new tweet section
+            for idx, h_idx in enumerate(handle_indices):
+                if idx + 1 < len(handle_indices):
+                    end_idx = handle_indices[idx + 1]
+                else:
+                    end_idx = len(lines)
+                tweet_lines = lines[h_idx:end_idx]
+                tweet_sections.append(tweet_lines)
+
+            # Process each tweet section
+            chunks = []
+            section_handles = []
+
+            for tweet_lines in tweet_sections:
+                tweet_raw = "\n".join(tweet_lines)
+
+                # Extract handles BEFORE stripping timestamps, since the
+                # handle may be on the same line as the timestamp
+                # (e.g. "JD Schooley @DirtyDog650 · 23h")
+                tweet_handles, tweet_without_handles = self.detect_handles(tweet_raw)
+
+                # Clean the tweet text
+                tweet_cleaned = self.strip_timestamps(tweet_without_handles)
+                tweet_cleaned = self.strip_statistics(tweet_cleaned)
+                tweet_cleaned = self.strip_inline_stats(tweet_cleaned)
+                tweet_cleaned = tweet_cleaned.strip()
+
+                if tweet_cleaned:
+                    chunks.append(tweet_cleaned)
+                    if tweet_handles:
+                        section_handles.append(tweet_handles[0])
+                    else:
+                        section_handles.append(None)
+
+            if not chunks:
+                return text
+
+            # Build the output
+            lines_out = ["tweet thread that goes as follows", ""]
+            for i, chunk in enumerate(chunks):
+                # Use the handle found in this section, or fall back to @unknown
+                handle = section_handles[i] if i < len(section_handles) and section_handles[i] else "@unknown"
+                lines_out.append(f"{handle}:")
+                lines_out.append(f"> {chunk}")
+                if i < len(chunks) - 1:
+                    lines_out.append("")
+
+            return "\n".join(lines_out)
+        else:
+            # No handle lines found — fall back to timestamp-based splitting
+            timestamp_indices = []
+            for i, line in enumerate(lines):
+                if self.has_twitter_timestamp(line):
+                    timestamp_indices.append(i)
+
+            if len(timestamp_indices) >= 1:
+                # Split using timestamps as delimiters
+                tweet_sections = []
+                processed_up_to = 0
+
+                for ts_idx in timestamp_indices:
+                    relative_ts = ts_idx - processed_up_to
+
+                    section_start = None
+                    for j in range(relative_ts - 1, -1, -1):
+                        stripped = lines[j].strip()
+                        if re.match(r"^@([\w.]+)$", stripped):
+                            section_start = j
+                            break
+                        if not stripped:
+                            found_handle_above = False
+                            for k in range(j - 1, -1, -1):
+                                above = lines[k].strip()
+                                if re.match(r"^@([\w.]+)$", above):
+                                    section_start = j + 1
+                                    found_handle_above = True
+                                    break
+                                if above:
+                                    break
+                            if found_handle_above:
+                                break
+                            continue
+
+                    if section_start is None:
+                        section_start = 0
+
+                    tweet_lines = lines[section_start:relative_ts + 1]
+                    tweet_sections.append(tweet_lines)
+
+                    lines = lines[relative_ts + 1:]
+                    processed_up_to = ts_idx + 1
+
+                chunks = []
+                section_handles = []
+
+                for tweet_lines in tweet_sections:
+                    tweet_raw = "\n".join(tweet_lines)
+                    tweet_handles, tweet_without_handles = self.detect_handles(tweet_raw)
+                    tweet_cleaned = self.strip_timestamps(tweet_without_handles)
+                    tweet_cleaned = self.strip_statistics(tweet_cleaned)
+                    tweet_cleaned = tweet_cleaned.strip()
+
+                    if tweet_cleaned:
+                        chunks.append(tweet_cleaned)
+                        if tweet_handles:
+                            section_handles.append(tweet_handles[0])
+                        else:
+                            section_handles.append(None)
+
+                if not chunks:
+                    return text
+
+                lines_out = ["tweet thread that goes as follows", ""]
+                for i, chunk in enumerate(chunks):
+                    handle = section_handles[i] if i < len(section_handles) and section_handles[i] else "@unknown"
+                    lines_out.append(f"{handle}:")
+                    lines_out.append(f"> {chunk}")
+                    if i < len(chunks) - 1:
+                        lines_out.append("")
+
+                return "\n".join(lines_out)
+            else:
+                # No timestamps found — fall back to content-based splitting
+                cleaned = self.strip_timestamps(text)
+                cleaned = self.strip_statistics(cleaned)
+                handles, cleaned = self.detect_handles(cleaned)
+                cleaned = cleaned.strip()
+
+                chunks = self.split_into_tweet_chunks(cleaned, 280)
+
+                if not chunks:
+                    return text
+
+                lines_out = ["tweet thread that goes as follows", ""]
+                for i, chunk in enumerate(chunks):
+                    handle = handles[i] if i < len(handles) else (
+                        handles[-1] if handles else "@unknown"
+                    )
+                    lines_out.append(f"{handle}:")
+                    lines_out.append(f"> {chunk}")
+                    if i < len(chunks) - 1:
+                        lines_out.append("")
+
+                return "\n".join(lines_out)
 
     def format_as_quote_retweet(self, text):
         """
@@ -873,41 +1212,166 @@ class PaddleOCRApp:
         quote retweet. the original tweet is by @handle_a and says
         > [original_text]. @handle_b then quote retweets this and says
         > [comment_text]
+
+        Uses timestamp lines (e.g. '· 23h') and handle lines found in the
+        raw text to determine the split between the original tweet and the
+        quote-retweet comment, rather than naively splitting on double newlines.
         """
         if not text:
             return text
 
-        cleaned = self.strip_timestamps(text)
-        cleaned = self.strip_statistics(cleaned)
-        handles, cleaned = self.detect_handles(cleaned)
-        cleaned = cleaned.strip()
+        # First strip "Replying to @handle" lines which are metadata
+        text = self.strip_reply_to(text)
 
-        parts = re.split(r"\n\n+", cleaned, maxsplit=1)
+        # Work with the raw text to find structural landmarks before cleaning.
+        lines = text.split("\n")
 
-        if len(parts) >= 2:
-            original_text = parts[0].strip()
-            comment_text = parts[1].strip()
+        # Strategy: find the timestamp line (e.g. "· 23h") in the raw text.
+        # In a quote-retweet screenshot, the timestamp appears at the bottom
+        # of the original tweet. The comment text is everything above the
+        # original tweet section.
+        #
+        # Structure of a quote-retweet screenshot:
+        #   [comment text — possibly multi-paragraph]
+        #   [divider / blank line]
+        #   [@original_handle]
+        #   [original tweet text]
+        #   [· 23h  <-- timestamp]
+        #   [stats line]
+
+        # Find the last timestamp line in the raw text — this marks the end
+        # of the original tweet section.
+        timestamp_line_idx = None
+        for i, line in enumerate(lines):
+            if self.has_twitter_timestamp(line):
+                timestamp_line_idx = i
+
+        if timestamp_line_idx is not None:
+            # The original tweet section ends at the timestamp line.
+            # Walk backwards from the timestamp to find where the original
+            # tweet section begins.
+            #
+            # The section starts either at:
+            # 1. A handle line (@username) — the original poster
+            # 2. A blank line that has a handle line above it (separator
+            #    between comment and original tweet)
+            # 3. The beginning of the text
+            #
+            # IMPORTANT: skip past blank lines that are WITHIN the comment
+            # (i.e. paragraph breaks), and only stop at a blank line that
+            # has a handle above it (tweet separator).
+            original_start = None
+            for i in range(timestamp_line_idx - 1, -1, -1):
+                stripped = lines[i].strip()
+                # A handle line like "@username" marks the start of the
+                # original tweet section (the handle of the original poster).
+                if re.match(r"^@([\w.]+)$", stripped):
+                    original_start = i
+                    break
+                if not stripped:
+                    # Blank line — check if there's a handle above it
+                    # (indicating this blank line is a tweet separator,
+                    # not a within-comment paragraph break)
+                    found_handle_above = False
+                    for k in range(i - 1, -1, -1):
+                        above = lines[k].strip()
+                        if re.match(r"^@([\w.]+)$", above):
+                            # Handle found above blank line — this blank
+                            # line is a tweet separator
+                            original_start = i + 1  # Start after the blank line
+                            found_handle_above = True
+                            break
+                        if above:
+                            # Non-empty, non-handle content above blank line
+                            # means this blank line is WITHIN the comment
+                            break
+                    if found_handle_above:
+                        break
+                    # Otherwise, this blank line is within the comment —
+                    # continue walking backwards
+                    continue
+
+            if original_start is not None:
+                # Extract: comment = lines before original_start,
+                #          original = lines from original_start to timestamp
+                comment_lines = lines[:original_start]
+                original_lines = lines[original_start:timestamp_line_idx + 1]
+                # Remove trailing blank lines from comment (the separator)
+                while comment_lines and not comment_lines[-1].strip():
+                    comment_lines.pop()
+                # Remove the handle line from original (it's metadata)
+                if original_lines and re.match(r"^@([\w.]+)$", original_lines[0].strip()):
+                    original_lines = original_lines[1:]
+            else:
+                # Fallback: couldn't find boundary, use midpoint split
+                mid = len(lines) // 2
+                comment_lines = lines[:mid]
+                original_lines = lines[mid:timestamp_line_idx + 1]
         else:
-            mid = len(cleaned) // 2
-            split_pos = cleaned.rfind("\n\n", 0, mid)
-            if split_pos == -1:
-                split_pos = cleaned.rfind(". ", 0, mid)
-                if split_pos != -1:
-                    split_pos += 1
-                else:
-                    split_pos = mid
-            original_text = cleaned[:split_pos].strip()
-            comment_text = cleaned[split_pos:].strip()
+            # No timestamp found — fall back to the original double-newline split
+            cleaned = self.strip_timestamps(text)
+            cleaned = self.strip_statistics(cleaned)
+            handles, cleaned = self.detect_handles(cleaned)
+            cleaned = cleaned.strip()
 
-        handle_a = handles[0] if len(handles) > 0 else "@original"
-        handle_b = handles[1] if len(handles) > 1 else (
-            handles[0] if handles else "@commenter"
+            parts = re.split(r"\n\n+", cleaned, maxsplit=1)
+            if len(parts) >= 2:
+                original_text = parts[0].strip()
+                comment_text = parts[1].strip()
+            else:
+                mid = len(cleaned) // 2
+                split_pos = cleaned.rfind("\n\n", 0, mid)
+                if split_pos == -1:
+                    split_pos = cleaned.rfind(". ", 0, mid)
+                    if split_pos != -1:
+                        split_pos += 1
+                    else:
+                        split_pos = mid
+                original_text = cleaned[:split_pos].strip()
+                comment_text = cleaned[split_pos:].strip()
+
+            handle_a = handles[0] if len(handles) > 0 else "@original"
+            handle_b = handles[1] if len(handles) > 1 else (
+                handles[0] if handles else "@commenter"
+            )
+            return (
+                f"quote retweet. the original tweet is by {handle_a} and says\n"
+                f"> {original_text}. \n{handle_b} then quote retweets this and says\n"
+                f"> {comment_text}"
+            )
+
+        # Clean the extracted sections
+        comment_raw = "\n".join(comment_lines)
+        original_raw = "\n".join(original_lines)
+
+        # Apply cleaning to each section independently.
+        # Extract handles BEFORE stripping timestamps, since the handle
+        # may be on the same line as the timestamp.
+        comment_handles, comment_without_handles = self.detect_handles(comment_raw)
+        comment_cleaned = self.strip_timestamps(comment_without_handles)
+        comment_cleaned = self.strip_statistics(comment_cleaned)
+        comment_cleaned = comment_cleaned.strip()
+
+        original_handles, original_without_handles = self.detect_handles(original_raw)
+        original_cleaned = self.strip_timestamps(original_without_handles)
+        original_cleaned = self.strip_statistics(original_cleaned)
+        original_cleaned = original_cleaned.strip()
+
+        # Determine handles for the output
+        all_handles = comment_handles + original_handles
+        handle_a = original_handles[0] if original_handles else (
+            all_handles[0] if all_handles else "@original"
+        )
+        handle_b = comment_handles[0] if comment_handles else (
+            all_handles[-1] if len(all_handles) > 1 else (
+                handle_a if all_handles else "@commenter"
+            )
         )
 
         return (
             f"quote retweet. the original tweet is by {handle_a} and says\n"
-            f"> {original_text}. \n{handle_b} then quote retweets this and says\n"
-            f"> {comment_text}"
+            f"> {original_cleaned}. \n{handle_b} then quote retweets this and says\n"
+            f"> {comment_cleaned}"
         )
 
     def format_as_reddit_post(self, text):
