@@ -44,7 +44,6 @@ class PaddleOCRApp:
         self.last_clipboard_image_hash = None
         self.clipboard_monitor_running = False
 
-        
     def setup_ui(self):
         # Main frame
         main_frame = ttk.Frame(self.root, padding="10")
@@ -353,7 +352,7 @@ class PaddleOCRApp:
         # but we still want to treat single bullet points as lists
         return end_index if end_index > start_index else None
 
-    def detect_paragraph_breaks(self, rec_boxes, texts, line_height_ratio=0.5):
+    def detect_paragraph_breaks(self, rec_boxes, texts, line_height_ratio=-0.1):
         """
         Detect whether blocks belong to same paragraph or new paragraph.
         Special handling for bullet points to keep them on separate lines.
@@ -538,19 +537,28 @@ class PaddleOCRApp:
     def has_twitter_timestamp(self, text):
         """
         Check if text contains a Twitter-style timestamp.
-        Detects patterns like '· 23h', '· 1d', '· 3w', '· Jan 3', '· 14:30'.
+        Detects patterns like '· 23h', '· 1d', '· 3w', '· Jan 3', '· 14:30',
+        '· 26/08/2014', and '23:58·03 Sep 20' (time·DD Mon YY at end of line).
         """
         if not text or not text.strip():
             return False
 
-        timestamp_pattern = re.compile(
-            r"·\s+"
+        stripped = text.strip()
+
+        # Pattern A: Standard format — middle dot BEFORE the time/date component
+        # e.g. "· 23h", "· Jan 3", "· 14:30", "· 26/08/2014"
+        # Also matches when the dot appears mid-line with text before it,
+        # as long as the timestamp component extends to end of line.
+        pattern_a = re.compile(
+            r"·\s*"
             r"(?:"
             r"\d+[hmdw]"
             r"|"
             r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}"
             r"|"
             r"\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?"
+            r"|"
+            r"\d{1,2}/\d{1,2}/\d{2,4}"  # date with slashes: 26/08/2014
             r"|"
             r"(?:Just now|Yesterday|Today|\d+\s+(?:min|hour|day|week|month|year)s?\s+ago)"
             r")"
@@ -560,8 +568,26 @@ class PaddleOCRApp:
             r"\s*$",
             re.IGNORECASE,
         )
+        if pattern_a.search(stripped):
+            return True
 
-        return bool(timestamp_pattern.search(text.strip()))
+        # Pattern B: Time followed by middle dot, then DD Mon YY at end of line
+        # e.g. "23:58·03 Sep 20"  (HH:MM·DD Mon YY)
+        # This handles the format where the timestamp appears as a suffix on
+        # the tweet text line, e.g. "PLEASE respond... 23:58·03 Sep 20"
+        pattern_b = re.compile(
+            r"\d{1,2}:\d{2}(?::\d{2})?\s*"  # time: HH:MM or HH:MM:SS
+            r"·\s*"                            # middle dot separator
+            r"\d{1,2}\s+"                      # day number
+            r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"  # month
+            r"\s+\d{2,4}"                      # year (2 or 4 digits)
+            r"\s*$",
+            re.IGNORECASE,
+        )
+        if pattern_b.search(stripped):
+            return True
+
+        return False
 
     def is_statistics_line(self, text):
         """
@@ -575,6 +601,8 @@ class PaddleOCRApp:
         - '8:44 · 04 Dec 23 · 90.3K Views'
         - '04 Dec 23' (date-only lines)
         - '1.2M' / '16,679' / 't16,679' (pure number/abbreviation lines)
+        - '10.3K Retweets and comments 24K Likes' (with 'and' between keywords)
+        - '06:15 · 26/08/2014 · Twitter Web Client' (time + slash-date + source)
         """
         if not text or not text.strip():
             return False
@@ -584,27 +612,61 @@ class PaddleOCRApp:
         # Pattern 1: Engagement keywords with numbers
         # e.g. "42 Retweets 4 Quotes 1,567 Likes"
         # e.g. "90.3K Views" / "1.2M Views"
+        # e.g. "10.3K Retweets and comments 24K Likes"
         engagement_keywords = [
             r'Retweets?', r'Quotes?', r'Likes?', r'Views?', r'Reposts?',
             r'Replies?', r'Comments?', r'Shares?', r'Saves?', r'Bookmarks?',
             r'Impressions?', r'Engagements?', r'Followers?', r'Following?',
             r'Subscribers?', r'Liked', r'Reposted', r'Follow(?:ing)?',
         ]
-        # Build a pattern that matches a line consisting mostly of numbers + these keywords
-        # Allow: numbers (with K/M/B suffixes), commas, dots, the keywords, and some noise chars
+        # Build a pattern that matches a line consisting of numbers + these keywords
+        # Allow: numbers (with K/M/B suffixes), commas, dots, the keywords, and
+        # the word "and" between keywords (e.g. "10.3K Retweets and comments 24K Likes")
+        # Also allow alphabetic words between keywords (e.g. "Quote Tweets" where
+        # "Tweets" is an alphabetic word between the "Quote" keyword and the next
+        # number/keyword group).
+        num_chars = r'[\d,.\sKkMmBbTt' + ''.join(chr(c) for c in range(0x00A0, 0x00C0)) + r']'
+        # Between keywords, allow either num_chars sequences OR alphabetic words
+        # (2+ letters). This handles cases like "Quote Tweets" where "Tweets" is
+        # an alphabetic word between the "Quote" keyword and the next number.
+        inter_keyword = r'(?:' + num_chars + r'+|[A-Za-z]{2,}\s*)+'
         engagement_pattern = (
             r'^'
-            r'[0-9,.\sKkMmBbTt' + ''.join(chr(c) for c in range(0x00A0, 0x00C0))  # include some unicode spaces
-            + r']*'
-            r'(?:' + '|'.join(engagement_keywords) + r')'
-            r'[0-9,.\sKkMmBbTt]*'
-            r'(?:' + '|'.join(engagement_keywords) + r')?'
-            r'[0-9,.\sKkMmBbTt]*'
-            r'(?:' + '|'.join(engagement_keywords) + r')?'
-            r'[0-9,.\sKkMmBbTt]*'
-            r'$'
+            + num_chars + r'*'
+            + r'(?:' + '|'.join(engagement_keywords) + r')'
+            + r'(?:' + inter_keyword + r'(?:' + '|'.join(engagement_keywords) + r')' + r')?'
+            + r'(?:' + inter_keyword + r'(?:' + '|'.join(engagement_keywords) + r')' + r')?'
+            + r'(?:' + inter_keyword + r'(?:' + '|'.join(engagement_keywords) + r')' + r')?'
+            + inter_keyword + r'?'
+            + r'$'
         )
         if re.match(engagement_pattern, stripped, re.IGNORECASE):
+            return True
+
+        # Pattern 1b: Engagement keywords with "and" between them (variant)
+        # e.g. "10.3K Retweets and comments 24K Likes"
+        # or "10.3K Retweets and comments 24K Likes and 5K Shares"
+        # This pattern handles the case where "and" connects two or more keyword phrases.
+        # Each "and" segment can have one or more (num*? keyword) pairs.
+        # Structure: ^ num*? kw (?: and (?: num*? kw )+ )+ num*? kw? num* $
+        and_engagement_pattern = re.compile(
+            r'^'
+            + num_chars + r'*?'
+            + r'(?:' + '|'.join(engagement_keywords) + r')'
+            + r'(?:'
+            + r'\s+and\s+'
+            + r'(?:'
+            + num_chars + r'*?'
+            + r'(?:' + '|'.join(engagement_keywords) + r')'
+            + r')+'
+            + r')+'
+            + num_chars + r'*?'
+            + r'(?:' + '|'.join(engagement_keywords) + r')?'
+            + num_chars + r'*'
+            + r'$',
+            re.IGNORECASE,
+        )
+        if and_engagement_pattern.match(stripped):
             return True
 
         # Pattern 2: Date format "04 Dec 23" or "Dec 04, 2023" as the entire line
@@ -635,7 +697,24 @@ class PaddleOCRApp:
         if time_date_stats_pattern.match(stripped):
             return True
 
-        # Pattern 4: Lines that are mostly numbers/abbreviations with no real words
+        # Pattern 4: Time + date with slashes + source text
+        # e.g. "06:15 · 26/08/2014 · Twitter Web Client"
+        # e.g. "12:30 · 01/01/2023 · Twitter for iPhone"
+        # e.g. "8:44 · 04/12/23 · Twitter Web App"
+        time_slash_date_source = re.compile(
+            r'^'
+            r'\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?'  # time
+            r'\s*[·\-–]\s*'  # separator
+            r'\d{1,2}/\d{1,2}/\d{2,4}'  # date with slashes (DD/MM/YYYY or MM/DD/YYYY)
+            r'(?:\s*[·\-–]\s*'  # separator
+            r'.+)?'  # optional source text (e.g. "Twitter Web Client")
+            r'\s*$',
+            re.IGNORECASE,
+        )
+        if time_slash_date_source.match(stripped):
+            return True
+
+        # Pattern 5: Lines that are mostly numbers/abbreviations with no real words
         # e.g. "Q281 t16,679" "61.8K ill 3.3M 8" "D3 172 1,379 ill 80.4K"
         # These consist of: optional letter prefix + numbers, commas, dots, K/M/B suffixes,
         # and at most 1-2 short "noise" words (like "ill", "t", "Q", "D")
@@ -667,7 +746,7 @@ class PaddleOCRApp:
         if len(tokens) >= 3 and stat_token_count >= 2 and real_word_count <= 1:
             return True
 
-        # Pattern 5: Single token that is just a number/abbreviation (e.g. "16,679", "61.8K")
+        # Pattern 6: Single token that is just a number/abbreviation (e.g. "16,679", "61.8K")
         # Only flag if it looks like a stat and is on its own line
         if len(tokens) == 1:
             single = tokens[0]
@@ -711,6 +790,10 @@ class PaddleOCRApp:
         metadata (e.g. "JD Schooley @DirtyDog650 · 23h"):
         -> extracts @DirtyDog650 and removes the entire line.
 
+        Also strips stray single-character lines that appear immediately before
+        a handle line (e.g. a stray "A" from OCR misreading the X.com logo or
+        avatar), since those are typically OCR noise, not tweet content.
+
         Returns: (handles_list, cleaned_text)
         """
         if not text:
@@ -744,6 +827,10 @@ class PaddleOCRApp:
                 handle = "@" + match.group(2)
                 handles.append(handle)
                 # Remove the entire line (nickname + handle + any trailing text)
+                # Also remove any stray single-character line immediately above
+                # this handle line (e.g. "A" from OCR misreading the X.com logo).
+                if cleaned_lines and len(cleaned_lines[-1].strip()) == 1:
+                    cleaned_lines.pop()
                 continue
 
             # Case 2: this line is just a @handle by itself
@@ -752,6 +839,10 @@ class PaddleOCRApp:
                 handle = "@" + handle_match.group(1)
                 handles.append(handle)
                 # Remove the handle line from the body
+                # Also remove any stray single-character line immediately above
+                # this handle line (e.g. "A" from OCR misreading the X.com logo).
+                if cleaned_lines and len(cleaned_lines[-1].strip()) == 1:
+                    cleaned_lines.pop()
                 continue
 
             # Case 3: this line might be a nickname, and the next line is @handle
@@ -764,6 +855,10 @@ class PaddleOCRApp:
                     handles.append(handle)
                     # Skip both the nickname line and the handle line
                     skip_next = True
+                    # Also remove any stray single-character line immediately above
+                    # the nickname line (e.g. "A" from OCR misreading the X.com logo).
+                    if cleaned_lines and len(cleaned_lines[-1].strip()) == 1:
+                        cleaned_lines.pop()
                     continue
 
             # Not a handle-related line, keep as-is
@@ -850,15 +945,77 @@ class PaddleOCRApp:
         return "\n".join(cleaned)
 
     def strip_timestamps(self, text):
-        """Remove lines that contain Twitter-style timestamps."""
+        """
+        Remove or strip Twitter-style timestamps from lines.
+        
+        If a line consists entirely of a timestamp (or timestamp + metadata),
+        the entire line is removed. If a timestamp is embedded within a line
+        of text (e.g. "PLEASE respond... 23:58·03 Sep 20"), only the timestamp
+        portion is stripped from the line, preserving the surrounding text.
+        """
         if not text:
             return text
         lines = text.split("\n")
-        cleaned = [
-            line
-            for line in lines
-            if not self.has_twitter_timestamp(line.strip())
-        ]
+        cleaned = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                cleaned.append(line)
+                continue
+            
+            # Check if the line is purely a timestamp line (remove entirely)
+            if self.has_twitter_timestamp(stripped):
+                # But first check if there's text before the timestamp
+                # that should be preserved
+                # Try pattern B first: HH:MM·DD Mon YY at end of line
+                ts_pattern_b = re.compile(
+                    r"\s*\d{1,2}:\d{2}(?::\d{2})?\s*"
+                    r"·\s*"
+                    r"\d{1,2}\s+"
+                    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+                    r"\s+\d{2,4}"
+                    r"\s*$",
+                    re.IGNORECASE,
+                )
+                text_before_b = ts_pattern_b.sub('', stripped).strip()
+                if text_before_b != stripped.strip():
+                    # Pattern B matched and removed something
+                    if text_before_b:
+                        # There's text before the timestamp — keep it
+                        cleaned.append(text_before_b)
+                    # If empty, it was a pure timestamp line — skip it
+                    continue
+                # Try pattern A: standard ·timestamp format
+                ts_pattern_a = re.compile(
+                    r"\s*·\s*"
+                    r"(?:"
+                    r"\d+[hmdw]"
+                    r"|"
+                    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}"
+                    r"|"
+                    r"\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?"
+                    r"|"
+                    r"\d{1,2}/\d{1,2}/\d{2,4}"
+                    r"|"
+                    r"(?:Just now|Yesterday|Today|\d+\s+(?:min|hour|day|week|month|year)s?\s+ago)"
+                    r")"
+                    r"\s*"
+                    r"(?:[×Xx]|Follow(?:ing)?|Repost(ed)?|Like(?:d)?|Reply(?:ing)?|"
+                    r"\d+(?:\.\d+)?[KkMm]?|@\w+)?"
+                    r"\s*$",
+                    re.IGNORECASE,
+                )
+                text_before_a = ts_pattern_a.sub('', stripped).strip()
+                if text_before_a != stripped.strip():
+                    # Pattern A matched and removed something
+                    if text_before_a:
+                        cleaned.append(text_before_a)
+                    # If empty, it was a pure timestamp line — skip it
+                    continue
+                # Neither pattern matched (shouldn't happen if has_twitter_timestamp returned True)
+                cleaned.append(line)
+            else:
+                cleaned.append(line)
         return "\n".join(cleaned)
 
     def strip_inline_stats(self, text):
@@ -880,9 +1037,14 @@ class PaddleOCRApp:
 
         # Pattern for inline timestamp+stats combos at end of line:
         # e.g. "text 8:44 · 04 Dec 23 · 90.3K Views 42 Retweets 4 Quotes 1,567 Likes"
+        # e.g. "text 06:15 · 26/08/2014 · Twitter Web Client"
         inline_timestamp_stats = re.compile(
             r'\s*\d{1,2}:\d{2}(?::\d{2})?\s*[·\-–]\s*'
-            r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2,4}'
+            r'(?:'
+            r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2,4}'  # 04 Dec 23
+            r'|'
+            r'\d{1,2}/\d{1,2}/\d{2,4}'  # 26/08/2014
+            r')'
             r'(?:\s*[·\-–]\s*'
             r'[\d,.\sKkMmBbTtA-Za-z]+'
             r'(?:Retweets?|Quotes?|Likes?|Views?|Reposts?|Replies?|Comments?|Shares?|Saves?|Bookmarks?|Impressions?|Engagements?|Followers?|Following?|Subscribers?|Liked|Reposted|Follow)?'
@@ -1213,9 +1375,21 @@ class PaddleOCRApp:
         > [original_text]. @handle_b then quote retweets this and says
         > [comment_text]
 
-        Uses timestamp lines (e.g. '· 23h') and handle lines found in the
-        raw text to determine the split between the original tweet and the
-        quote-retweet comment, rather than naively splitting on double newlines.
+        Structure of a quote-retweet screenshot:
+          [Quote retweeter's display name + @handle]
+          [Quote retweeter's comment text]
+          [· 23h  <-- timestamp of the quote retweet]
+          [divider / blank line]
+          [Embedded quoted tweet card:]
+            [Original poster's display name + @handle]
+            [Original tweet body]
+            [· 23h  <-- timestamp of the original tweet (if visible)]
+            [stats line]
+
+        The timestamp belongs to the quote retweet (comment), not the
+        original tweet. Everything from the start up to and including
+        the timestamp line is the comment section. Everything after the
+        blank line separator is the original tweet section.
         """
         if not text:
             return text
@@ -1226,87 +1400,45 @@ class PaddleOCRApp:
         # Work with the raw text to find structural landmarks before cleaning.
         lines = text.split("\n")
 
-        # Strategy: find the timestamp line (e.g. "· 23h") in the raw text.
-        # In a quote-retweet screenshot, the timestamp appears at the bottom
-        # of the original tweet. The comment text is everything above the
-        # original tweet section.
+        # Strategy: find the LAST timestamp line in the raw text.
+        # In a quote-retweet screenshot, the timestamp appears at the
+        # bottom of the quote retweet (comment) section. The original
+        # tweet is below the blank line separator.
         #
-        # Structure of a quote-retweet screenshot:
-        #   [comment text — possibly multi-paragraph]
-        #   [divider / blank line]
-        #   [@original_handle]
-        #   [original tweet text]
-        #   [· 23h  <-- timestamp]
-        #   [stats line]
+        # The timestamp marks the end of the COMMENT section, not the
+        # original tweet. Everything from the start up to the timestamp
+        # line is the comment. Everything after the blank line separator
+        # below the timestamp is the original tweet.
 
-        # Find the last timestamp line in the raw text — this marks the end
-        # of the original tweet section.
+        # Find the last timestamp line in the raw text.
         timestamp_line_idx = None
         for i, line in enumerate(lines):
             if self.has_twitter_timestamp(line):
                 timestamp_line_idx = i
 
         if timestamp_line_idx is not None:
-            # The original tweet section ends at the timestamp line.
-            # Walk backwards from the timestamp to find where the original
-            # tweet section begins.
-            #
-            # The section starts either at:
-            # 1. A handle line (@username) — the original poster
-            # 2. A blank line that has a handle line above it (separator
-            #    between comment and original tweet)
-            # 3. The beginning of the text
-            #
-            # IMPORTANT: skip past blank lines that are WITHIN the comment
-            # (i.e. paragraph breaks), and only stop at a blank line that
-            # has a handle above it (tweet separator).
+            # The COMMENT section ends at the timestamp line.
+            # The comment is everything from the start to the timestamp.
+            # The original tweet is everything after the blank line
+            # separator below the timestamp.
+
+            # Find the first non-blank line AFTER the timestamp line —
+            # that's the start of the original tweet section.
             original_start = None
-            for i in range(timestamp_line_idx - 1, -1, -1):
-                stripped = lines[i].strip()
-                # A handle line like "@username" marks the start of the
-                # original tweet section (the handle of the original poster).
-                if re.match(r"^@([\w.]+)$", stripped):
-                    original_start = i
+            for j in range(timestamp_line_idx + 1, len(lines)):
+                if lines[j].strip():
+                    original_start = j
                     break
-                if not stripped:
-                    # Blank line — check if there's a handle above it
-                    # (indicating this blank line is a tweet separator,
-                    # not a within-comment paragraph break)
-                    found_handle_above = False
-                    for k in range(i - 1, -1, -1):
-                        above = lines[k].strip()
-                        if re.match(r"^@([\w.]+)$", above):
-                            # Handle found above blank line — this blank
-                            # line is a tweet separator
-                            original_start = i + 1  # Start after the blank line
-                            found_handle_above = True
-                            break
-                        if above:
-                            # Non-empty, non-handle content above blank line
-                            # means this blank line is WITHIN the comment
-                            break
-                    if found_handle_above:
-                        break
-                    # Otherwise, this blank line is within the comment —
-                    # continue walking backwards
-                    continue
 
             if original_start is not None:
-                # Extract: comment = lines before original_start,
-                #          original = lines from original_start to timestamp
-                comment_lines = lines[:original_start]
-                original_lines = lines[original_start:timestamp_line_idx + 1]
-                # Remove trailing blank lines from comment (the separator)
-                while comment_lines and not comment_lines[-1].strip():
-                    comment_lines.pop()
-                # Remove the handle line from original (it's metadata)
-                if original_lines and re.match(r"^@([\w.]+)$", original_lines[0].strip()):
-                    original_lines = original_lines[1:]
+                # Comment = lines from start to timestamp (inclusive)
+                comment_lines = lines[:timestamp_line_idx + 1]
+                # Original = lines from original_start to end
+                original_lines = lines[original_start:]
             else:
-                # Fallback: couldn't find boundary, use midpoint split
-                mid = len(lines) // 2
-                comment_lines = lines[:mid]
-                original_lines = lines[mid:timestamp_line_idx + 1]
+                # No content found after timestamp — fallback
+                comment_lines = lines[:timestamp_line_idx + 1]
+                original_lines = []
         else:
             # No timestamp found — fall back to the original double-newline split
             cleaned = self.strip_timestamps(text)
@@ -1330,13 +1462,20 @@ class PaddleOCRApp:
                 original_text = cleaned[:split_pos].strip()
                 comment_text = cleaned[split_pos:].strip()
 
-            handle_a = handles[0] if len(handles) > 0 else "@original"
-            handle_b = handles[1] if len(handles) > 1 else (
-                handles[0] if handles else "@commenter"
-            )
+            # handles are in visual order: first = quote retweeter, last = original author
+            if len(handles) >= 2:
+                handle_a = handles[-1]  # Last = original author
+                handle_b = handles[0]   # First = quote retweeter
+            elif len(handles) == 1:
+                handle_a = "@original"
+                handle_b = handles[0]
+            else:
+                handle_a = "@original"
+                handle_b = "@commenter"
             return (
-                f"quote retweet. the original tweet is by {handle_a} and says\n"
-                f"> {original_text}. \n{handle_b} then quote retweets this and says\n"
+                f"quote retweet. the original tweet is by {handle_a} and says\n\n"
+                f"> {original_text}\n\n"
+                f"{handle_b} then quote retweets this and says\n"
                 f"> {comment_text}"
             )
 
@@ -1344,33 +1483,147 @@ class PaddleOCRApp:
         comment_raw = "\n".join(comment_lines)
         original_raw = "\n".join(original_lines)
 
-        # Apply cleaning to each section independently.
-        # Extract handles BEFORE stripping timestamps, since the handle
-        # may be on the same line as the timestamp.
-        comment_handles, comment_without_handles = self.detect_handles(comment_raw)
-        comment_cleaned = self.strip_timestamps(comment_without_handles)
-        comment_cleaned = self.strip_statistics(comment_cleaned)
-        comment_cleaned = comment_cleaned.strip()
-
-        original_handles, original_without_handles = self.detect_handles(original_raw)
-        original_cleaned = self.strip_timestamps(original_without_handles)
-        original_cleaned = self.strip_statistics(original_cleaned)
-        original_cleaned = original_cleaned.strip()
-
-        # Determine handles for the output
-        all_handles = comment_handles + original_handles
-        handle_a = original_handles[0] if original_handles else (
-            all_handles[0] if all_handles else "@original"
-        )
-        handle_b = comment_handles[0] if comment_handles else (
-            all_handles[-1] if len(all_handles) > 1 else (
-                handle_a if all_handles else "@commenter"
+        # --- Clean the COMMENT section ---
+        # The comment section may have the display name + @handle + timestamp
+        # all merged into one line by OCR. Handle this by stripping the
+        # leading display name + @handle prefix and trailing timestamp inline.
+        if timestamp_line_idx is not None and len(comment_lines) == 1:
+            comment_line = comment_lines[0]
+            # Extract handles for the output
+            handle_match = re.match(r"^(.{0,50}?)@([\w.]+)\s*", comment_line)
+            if handle_match:
+                comment_handles = ["@" + handle_match.group(2)]
+                # Remove the leading display name + handle prefix
+                body_start = handle_match.end()
+                comment_cleaned = comment_line[body_start:].strip()
+            else:
+                comment_handles = []
+                comment_cleaned = comment_line
+            # Strip trailing timestamp from the end of the body inline
+            ts_pattern = re.compile(
+                r"\s*·\s+\d+[hmdw]\s*$",
+                re.IGNORECASE,
             )
-        )
+            comment_cleaned = ts_pattern.sub('', comment_cleaned)
+            # Also strip any trailing display name + @handle duplication
+            # that OCR may have merged onto the same line
+            comment_cleaned = re.sub(
+                r'\s*\w+\s+@[\w.]+\s*$',
+                '',
+                comment_cleaned,
+            ).strip()
+            comment_cleaned = self.strip_statistics(comment_cleaned)
+            comment_cleaned = comment_cleaned.strip()
+        else:
+            comment_handles, comment_without_handles = self.detect_handles(comment_raw)
+            comment_cleaned = self.strip_timestamps(comment_without_handles)
+            comment_cleaned = self.strip_statistics(comment_cleaned)
+            comment_cleaned = comment_cleaned.strip()
+
+            # If detect_handles() wiped out the entire comment (false positive
+            # where an @mention in the content was mistaken for a poster handle),
+            # fall back to just stripping the @mention(s) inline instead.
+            if not comment_cleaned and comment_raw.strip():
+                comment_cleaned = re.sub(
+                    r'@([\w.]+)',
+                    r'@/\1',
+                    comment_raw,
+                ).strip()
+                comment_handles = re.findall(r'@([\w.]+)', comment_raw)
+                comment_handles = ['@' + h for h in comment_handles]
+                comment_cleaned = self.strip_timestamps(comment_cleaned)
+                comment_cleaned = self.strip_statistics(comment_cleaned)
+                comment_cleaned = comment_cleaned.strip()
+
+        # --- Clean the ORIGINAL TWEET section ---
+        # The original tweet may be on a single line with an @handle mention
+        # as content (e.g. "#nw first watch w/ @SILNTKLL"). detect_handles()
+        # would incorrectly remove the entire line. Instead, extract all
+        # @handles and strip them inline, keeping the body text.
+        #
+        # IMPORTANT: When the original tweet section has only 1 line, the
+        # handles extracted via re.findall() are CONTENT MENTIONS, not poster
+        # handles. The actual original author's handle is typically found in
+        # the comment section (on the embedded tweet card header). We track
+        # whether original_handles came from content mentions vs poster handles
+        # so the handle determination logic below can make the right choice.
+        original_handles_are_mentions = False
+        if len(original_lines) == 1:
+            original_line = original_lines[0]
+            # Extract all @handles from the line
+            found_handles = re.findall(r'@([\w.]+)', original_line)
+            original_handles = ['@' + h for h in found_handles]
+            original_handles_are_mentions = True
+            # Replace @mentions with @/mention in the body (preserve the text,
+            # just change the @ prefix to @/ to avoid confusion with handles)
+            original_cleaned = re.sub(r'@([\w.]+)', r'@/\1', original_line).strip()
+            original_cleaned = self.strip_timestamps(original_cleaned)
+            original_cleaned = self.strip_statistics(original_cleaned)
+            original_cleaned = original_cleaned.strip()
+        else:
+            original_handles, original_without_handles = self.detect_handles(original_raw)
+            original_cleaned = self.strip_timestamps(original_without_handles)
+            original_cleaned = self.strip_statistics(original_cleaned)
+            original_cleaned = original_cleaned.strip()
+
+            # If detect_handles() wiped out the entire original tweet,
+            # fall back to inline @mention stripping
+            if not original_cleaned and original_raw.strip():
+                original_cleaned = re.sub(
+                    r'@([\w.]+)',
+                    r'@/\1',
+                    original_raw,
+                ).strip()
+                original_handles = re.findall(r'@([\w.]+)', original_raw)
+                original_handles = ['@' + h for h in original_handles]
+                original_handles_are_mentions = True
+                original_cleaned = self.strip_timestamps(original_cleaned)
+                original_cleaned = self.strip_statistics(original_cleaned)
+                original_cleaned = original_cleaned.strip()
+
+        # Determine handles for the output.
+        # The comment section contains both the quote retweeter's handle
+        # (at the top of the section) and the original author's handle
+        # (on the embedded tweet card at the bottom of the section).
+        # detect_handles() finds them in visual order, so:
+        #   - The LAST handle in comment_handles is the original author
+        #   - The FIRST handle in comment_handles is the quote retweeter
+        # Fall back to original_handles if comment_handles is empty.
+        #
+        # IMPORTANT: When original_handles_are_mentions is True, the handles
+        # in original_handles are just @mentions within the tweet content
+        # (e.g. "#nw first watch w/ @SILNTKLL"), NOT the original author's
+        # poster handle. In this case, the original author's handle is the
+        # LAST handle from the comment section (which represents the embedded
+        # tweet card's header). We should NOT use original_handles[0] as the
+        # original author.
+        if len(comment_handles) >= 2:
+            # Both handles found in comment section
+            handle_a = comment_handles[-1]  # Last = original author
+            handle_b = comment_handles[0]   # First = quote retweeter
+        elif len(comment_handles) == 1:
+            # Only one handle found in comment section.
+            # If original_handles are just content mentions (not poster handles),
+            # the original author is the same as the comment section handle
+            # (the embedded tweet card's author handle was merged into the
+            # comment section by OCR). Otherwise, use original_handles[0].
+            if original_handles_are_mentions:
+                handle_a = comment_handles[0]  # Original author = same handle
+                handle_b = comment_handles[0]  # Quote retweeter = same handle
+            else:
+                handle_b = comment_handles[0]
+                handle_a = original_handles[0] if original_handles else "@original"
+        else:
+            # No handles in comment section
+            handle_a = original_handles[0] if original_handles else "@original"
+            handle_b = original_handles[-1] if len(original_handles) > 1 else (
+                original_handles[0] if original_handles else "@commenter"
+            )
 
         return (
-            f"quote retweet. the original tweet is by {handle_a} and says\n"
-            f"> {original_cleaned}. \n{handle_b} then quote retweets this and says\n"
+            f"quote retweet. the original tweet is by {handle_a} and says\n\n"
+            f"> {original_cleaned}\n\n"
+            f"{handle_b} then quote retweets this and says\n"
             f"> {comment_cleaned}"
         )
 
