@@ -22,7 +22,8 @@ class PaddleOCRApp:
         self.annotated_image = None
         self.ocr_model = None
         self.current_ocr_result = None
-        self.raw_ocr_text = None  # Stores the original full OCR text (unformatted)
+        self.raw_ocr_text = None  # Stores the raw OCR text (newline-joined extracted lines)
+        self.formatted_ocr_text = None  # Stores cleaned + paragraph-formatted OCR text
 
         # Output type for formatting (tweet, tweet thread, etc.)
         self.output_type_var = tk.StringVar(value="tweet")
@@ -1823,13 +1824,18 @@ class PaddleOCRApp:
                                 draw.line(points, fill="red", width=2)
                 
                 if extracted_lines:
-                    # Use paragraph-aware formatting with bounding boxes
-                    raw_text = self.format_text_with_paragraphs(extracted_lines, rec_boxes)
+                    # Save the raw OCR text as newline-joined extracted lines
+                    self.raw_ocr_text = "\n".join(extracted_lines)
                     
-                    # Save the original full OCR text for dynamic reformatting
-                    self.raw_ocr_text = raw_text
+                    # Create a cleaned version: strip timestamps and stats from raw text,
+                    # then apply paragraph-aware formatting
+                    cleaned_raw = self.strip_timestamps(self.raw_ocr_text)
+                    cleaned_raw = self.strip_statistics(cleaned_raw)
+                    # Re-split cleaned text into lines for paragraph formatting
+                    cleaned_lines = cleaned_raw.split("\n")
+                    self.formatted_ocr_text = self.format_text_with_paragraphs(cleaned_lines, rec_boxes)
                     
-                    # Apply selected output formatting
+                    # Apply selected output formatting using the cleaned + formatted text
                     output_type = self.output_type_var.get()
                     formatter = {
                         "tweet": self.format_as_tweet,
@@ -1840,7 +1846,7 @@ class PaddleOCRApp:
                         "reddit thread": self.format_as_reddit_thread,
                     }
                     formatter_func = formatter.get(output_type, self.format_as_tweet)
-                    full_text = formatter_func(raw_text)
+                    full_text = formatter_func(self.formatted_ocr_text)
                     
                     # Clear text widget and insert formatted text
                     self.text_widget.delete(1.0, tk.END)
@@ -1868,7 +1874,7 @@ class PaddleOCRApp:
     
     def on_output_type_change(self, event=None):
         """Re-format the displayed text when the output type dropdown changes."""
-        if self.raw_ocr_text is None:
+        if self.formatted_ocr_text is None:
             return  # No OCR results yet
 
         output_type = self.output_type_var.get()
@@ -1881,7 +1887,7 @@ class PaddleOCRApp:
             "reddit thread": self.format_as_reddit_thread,
         }
         formatter_func = formatter.get(output_type, self.format_as_tweet)
-        full_text = formatter_func(self.raw_ocr_text)
+        full_text = formatter_func(self.formatted_ocr_text)
 
         # Update the text widget with the newly formatted text
         self.text_widget.delete(1.0, tk.END)
@@ -1902,8 +1908,8 @@ class PaddleOCRApp:
                 "reddit thread": self.format_as_reddit_thread,
             }
             formatter_func = formatter.get(output_type, self.format_as_tweet)
-            # Use raw_ocr_text if available, otherwise fall back to widget text
-            source_text = self.raw_ocr_text if self.raw_ocr_text else text
+            # Use formatted_ocr_text if available, otherwise fall back to widget text
+            source_text = self.formatted_ocr_text if self.formatted_ocr_text else text
             formatted_text = formatter_func(source_text)
             pyperclip.copy(formatted_text)
             self.status_var.set(
@@ -1920,6 +1926,7 @@ class PaddleOCRApp:
         self.annotated_image = None
         self.current_ocr_result = None
         self.raw_ocr_text = None
+        self.formatted_ocr_text = None
         self.image_label.config(image='', text="No image pasted yet\n\nPress Ctrl+V to paste an image")
         self.image_label.image = None
         self.text_widget.delete(1.0, tk.END)
