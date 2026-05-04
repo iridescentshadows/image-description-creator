@@ -723,6 +723,7 @@ class PaddleOCRApp:
         tokens = stripped.split()
         real_word_count = 0
         stat_token_count = 0
+        short_word_count = 0  # tracks short (1-3 char) alpha words that may be OCR noise
         for token in tokens:
             # Check if it's a stat token: number-like (with K/M/B, commas, dots)
             if re.match(r'^[A-Za-z]?\d[\d,.]*[KkMmBbTt]?$', token):
@@ -736,7 +737,19 @@ class PaddleOCRApp:
             # Check if it's a number+K/M suffix
             elif re.match(r'^\d+(?:\.\d+)?[KkMmBbTt]$', token):
                 stat_token_count += 1
-            # Otherwise it's a real word
+            # Check if it's a 3-char alpha word (like "ill", "the", "for", "and")
+            # These are borderline — could be noise or content. Track separately.
+            elif re.match(r'^[A-Za-z]{3}$', token):
+                short_word_count += 1
+            # Check if it's a "jumbled" alphanumeric token — OCR noise where letters
+            # and digits are intermixed in ways that don't match clean stat patterns.
+            # Examples: "ill637" (3 letters + digits), "t2965.6K1ll90K" (complex mix),
+            # "1ll90K" (digit + letters + digits + K suffix).
+            # These are tokens that contain BOTH letters AND digits but don't match
+            # the clean patterns above. They are almost always OCR noise, not real words.
+            elif re.match(r'^(?=.*[A-Za-z])(?=.*\d).+$', token):
+                stat_token_count += 1
+            # Otherwise it's a real word (4+ chars or contains non-alpha chars)
             else:
                 real_word_count += 1
 
@@ -746,19 +759,31 @@ class PaddleOCRApp:
         # Also catch lines with 1 real word and rest stats (e.g. "61.8K ill 3.3M 8")
         if len(tokens) >= 3 and stat_token_count >= 2 and real_word_count <= 1:
             return True
+        # Catch 2-token lines like "ill 3.3M" where one token is a stat number
+        # and the other is a short (1-3 char) word that looks like OCR noise.
+        # The short word must be 3 chars or fewer, and there must be at least
+        # one stat number token present.
+        if len(tokens) >= 2 and stat_token_count >= 1 and real_word_count == 0 and short_word_count >= 1:
+            return True
 
         # Pattern 6: Single token that is just a number/abbreviation (e.g. "16,679", "61.8K")
         # Only flag if it looks like a stat and is on its own line
         if len(tokens) == 1:
             single = tokens[0]
-            # Pure number with optional commas
-            if re.match(r'^[\d,]+$', single) and len(single) >= 3:
+            # Pure number with optional commas (any length, including single digits like "8")
+            if re.match(r'^[\d,]+$', single):
                 return True
             # Number with K/M/B suffix
             if re.match(r'^\d+(?:\.\d+)?[KkMmBbTt]$', single):
                 return True
             # Letter + number combo like "Q281", "D3", "t16,679"
             if re.match(r'^[A-Za-z]\d[\d,]*[KkMmBbTt]?$', single):
+                return True
+            # Jumbled alphanumeric token like "ill637" (letters + digits mixed)
+            if re.match(r'^(?=.*[A-Za-z])(?=.*\d).+$', single):
+                return True
+            # Single letter (1 char, alpha only) — OCR noise on its own line
+            if re.match(r'^[A-Za-z]$', single):
                 return True
 
         return False
@@ -924,15 +949,29 @@ class PaddleOCRApp:
                 handle = parts[1].strip()
                 after = parts[2].strip()
 
-                # If the text before the marker ends with a display name
-                # fragment (e.g. "Oklahoma Department of..."), move it to
-                # the new tweet section as it belongs to the replying account.
+                # Determine if the text before the marker is a display name
+                # (belonging to the replying account) rather than tweet content.
+                # Two cases:
+                #   1. Display name ending with "..." (e.g. "Oklahoma Department of...")
+                #   2. Short display name without "..." (e.g. "JD Schooley")
+                #      Heuristic: ≤ 50 chars, no sentence-ending punctuation,
+                #      and the handle line starts a new tweet (after has content).
                 dn_match = trailing_display_name.search(before)
-                if dn_match:
-                    display_name = dn_match.group(0).strip()
-                    before = before[:dn_match.start()].strip()
+                is_short_display_name = (
+                    before
+                    and len(before) <= 50
+                    and not re.search(r'[.?!]\s*$', before)
+                    and after.strip()
+                )
+                if dn_match or is_short_display_name:
+                    if dn_match:
+                        display_name = dn_match.group(0).strip()
+                        before = before[:dn_match.start()].strip()
+                    else:
+                        display_name = before
+                        before = ""
                     # Prepend the display name to the handle line
-                    handle = f"{display_name} {handle}"
+                    handle = f"{display_name} {handle}".strip()
 
                 if before:
                     cleaned.append(before)
@@ -1062,11 +1101,15 @@ class PaddleOCRApp:
             r'\s+'
             r'(?:'
             r'[A-Za-z]?\d[\d,.]*[KkMmBbTt]?'  # e.g. D3, 172, 1,379, 80.4K
+            r'|'
+            r'(?=[A-Za-z]*\d)[A-Za-z\d]{2,}'  # jumbled alphanumeric like "ill637", "1ll90K"
             r')'
             r'(?:\s+(?:'
             r'[A-Za-z]?\d[\d,.]*[KkMmBbTt]?'  # more number-like tokens
             r'|'
             r'[A-Za-z]{1,3}(?=\s+(?:[A-Za-z]?\d|[\d,]))'  # short word before more stats
+            r'|'
+            r'(?=[A-Za-z]*\d)[A-Za-z\d]{2,}'  # jumbled alphanumeric
             r'))*'
             r'\s*',
         )
@@ -1154,8 +1197,10 @@ class PaddleOCRApp:
         # Extract handles BEFORE stripping timestamps, since the handle
         # may be on the same line as the timestamp
         handles, cleaned = self.detect_handles(cleaned)
+        # Strip timestamps from the body (timestamps are preserved in
+        # formatted_ocr_text so earlier formatters can use them for
+        # structural detection)
         cleaned = self.strip_timestamps(cleaned)
-        cleaned = self.strip_statistics(cleaned)
         cleaned = cleaned.strip()
 
         handle_str = handles[0] if handles else "@unknown"
@@ -1245,10 +1290,50 @@ class PaddleOCRApp:
                 # (e.g. "JD Schooley @DirtyDog650 · 23h")
                 tweet_handles, tweet_without_handles = self.detect_handles(tweet_raw)
 
+                # Strip leading display name fragments that OCR merged onto
+                # the same line as tweet content. This handles cases like:
+                #   "Oklahoma Department... Getting her an engagement ring..."
+                # where "Oklahoma Department..." is a display name (ending
+                # with "...") that got concatenated with the tweet body.
+                # Also handles cases where the display name is followed by a
+                # timestamp on the same line (e.g. "Oklahoma Department...· h")
+                # with the actual tweet content on the next line.
+                tweet_lines_clean = tweet_without_handles.split("\n")
+                if tweet_lines_clean:
+                    first_line = tweet_lines_clean[0]
+                    # Match: text ending with "..." optionally followed by a
+                    # timestamp, then either more content on the same line or
+                    # nothing (content is on the next line).
+                    # Pattern 1: "..." followed by content on the same line
+                    # e.g. "Oklahoma Department... Getting her an engagement ring..."
+                    dn_content_match = re.match(
+                        r'^(.{3,}?\.\.\.)\s+(.+)',
+                        first_line,
+                    )
+                    if dn_content_match:
+                        # The part before "..." is a display name fragment
+                        # Keep only the content after it
+                        tweet_lines_clean[0] = dn_content_match.group(2)
+                    else:
+                        # Pattern 2: "..." optionally followed by a timestamp,
+                        # with no tweet content on this line (content is below).
+                        # e.g. "Oklahoma Department...· h" or just "Oklahoma Department..."
+                        # Strip this entire line since it's a display name fragment.
+                        dn_ts_match = re.match(
+                            r'^.{3,}\.\.\.',
+                            first_line,
+                        )
+                        if dn_ts_match:
+                            # Remove the display name line entirely
+                            tweet_lines_clean.pop(0)
+
+                tweet_cleaned = "\n".join(tweet_lines_clean)
+
                 # Clean the tweet text
-                tweet_cleaned = self.strip_timestamps(tweet_without_handles)
-                tweet_cleaned = self.strip_statistics(tweet_cleaned)
                 tweet_cleaned = self.strip_inline_stats(tweet_cleaned)
+                # Strip timestamps from each tweet chunk (timestamps are preserved
+                # in formatted_ocr_text so the handle-based split can use them)
+                tweet_cleaned = self.strip_timestamps(tweet_cleaned)
                 tweet_cleaned = tweet_cleaned.strip()
 
                 if tweet_cleaned:
@@ -1322,8 +1407,9 @@ class PaddleOCRApp:
                 for tweet_lines in tweet_sections:
                     tweet_raw = "\n".join(tweet_lines)
                     tweet_handles, tweet_without_handles = self.detect_handles(tweet_raw)
+                    # Strip timestamps from each tweet chunk (timestamps were used
+                    # for splitting above, now remove them from the output)
                     tweet_cleaned = self.strip_timestamps(tweet_without_handles)
-                    tweet_cleaned = self.strip_statistics(tweet_cleaned)
                     tweet_cleaned = tweet_cleaned.strip()
 
                     if tweet_cleaned:
@@ -1347,9 +1433,9 @@ class PaddleOCRApp:
                 return "\n".join(lines_out)
             else:
                 # No timestamps found — fall back to content-based splitting
-                cleaned = self.strip_timestamps(text)
-                cleaned = self.strip_statistics(cleaned)
-                handles, cleaned = self.detect_handles(cleaned)
+                handles, cleaned = self.detect_handles(text)
+                # Strip timestamps from the text before content-based splitting
+                cleaned = self.strip_timestamps(cleaned)
                 cleaned = cleaned.strip()
 
                 chunks = self.split_into_tweet_chunks(cleaned, 280)
@@ -1442,9 +1528,9 @@ class PaddleOCRApp:
                 original_lines = []
         else:
             # No timestamp found — fall back to the original double-newline split
-            cleaned = self.strip_timestamps(text)
-            cleaned = self.strip_statistics(cleaned)
-            handles, cleaned = self.detect_handles(cleaned)
+            handles, cleaned = self.detect_handles(text)
+            # Strip timestamps from the text before splitting
+            cleaned = self.strip_timestamps(cleaned)
             cleaned = cleaned.strip()
 
             parts = re.split(r"\n\n+", cleaned, maxsplit=1)
@@ -1513,12 +1599,12 @@ class PaddleOCRApp:
                 '',
                 comment_cleaned,
             ).strip()
-            comment_cleaned = self.strip_statistics(comment_cleaned)
             comment_cleaned = comment_cleaned.strip()
         else:
             comment_handles, comment_without_handles = self.detect_handles(comment_raw)
+            # Strip timestamps from the comment section (timestamps were used
+            # for structural splitting above, now remove them from the output)
             comment_cleaned = self.strip_timestamps(comment_without_handles)
-            comment_cleaned = self.strip_statistics(comment_cleaned)
             comment_cleaned = comment_cleaned.strip()
 
             # If detect_handles() wiped out the entire comment (false positive
@@ -1532,8 +1618,8 @@ class PaddleOCRApp:
                 ).strip()
                 comment_handles = re.findall(r'@([\w.]+)', comment_raw)
                 comment_handles = ['@' + h for h in comment_handles]
+                # Also strip timestamps from the fallback
                 comment_cleaned = self.strip_timestamps(comment_cleaned)
-                comment_cleaned = self.strip_statistics(comment_cleaned)
                 comment_cleaned = comment_cleaned.strip()
 
         # --- Clean the ORIGINAL TWEET section ---
@@ -1558,13 +1644,14 @@ class PaddleOCRApp:
             # Replace @mentions with @/mention in the body (preserve the text,
             # just change the @ prefix to @/ to avoid confusion with handles)
             original_cleaned = re.sub(r'@([\w.]+)', r'@/\1', original_line).strip()
+            # Strip timestamps from the original tweet body
             original_cleaned = self.strip_timestamps(original_cleaned)
-            original_cleaned = self.strip_statistics(original_cleaned)
             original_cleaned = original_cleaned.strip()
         else:
             original_handles, original_without_handles = self.detect_handles(original_raw)
+            # Strip timestamps from the original tweet section (timestamps were
+            # used for structural splitting above, now remove them from the output)
             original_cleaned = self.strip_timestamps(original_without_handles)
-            original_cleaned = self.strip_statistics(original_cleaned)
             original_cleaned = original_cleaned.strip()
 
             # If detect_handles() wiped out the entire original tweet,
@@ -1578,8 +1665,8 @@ class PaddleOCRApp:
                 original_handles = re.findall(r'@([\w.]+)', original_raw)
                 original_handles = ['@' + h for h in original_handles]
                 original_handles_are_mentions = True
+                # Also strip timestamps from the fallback
                 original_cleaned = self.strip_timestamps(original_cleaned)
-                original_cleaned = self.strip_statistics(original_cleaned)
                 original_cleaned = original_cleaned.strip()
 
         # Determine handles for the output.
@@ -1629,16 +1716,22 @@ class PaddleOCRApp:
         )
 
     def format_as_reddit_post(self, text):
-        """WIP: Return raw OCR text unchanged."""
-        return text
+        """WIP: Return raw OCR text with timestamps stripped."""
+        if not text:
+            return text
+        return self.strip_timestamps(text)
 
     def format_as_reddit_comment(self, text):
-        """WIP: Return raw OCR text unchanged."""
-        return text
+        """WIP: Return raw OCR text with timestamps stripped."""
+        if not text:
+            return text
+        return self.strip_timestamps(text)
 
     def format_as_reddit_thread(self, text):
-        """WIP: Return raw OCR text unchanged."""
-        return text
+        """WIP: Return raw OCR text with timestamps stripped."""
+        if not text:
+            return text
+        return self.strip_timestamps(text)
 
     def paste_from_clipboard(self, event=None):
         """Handle image paste from clipboard"""
@@ -1827,13 +1920,47 @@ class PaddleOCRApp:
                     # Save the raw OCR text as newline-joined extracted lines
                     self.raw_ocr_text = "\n".join(extracted_lines)
                     
-                    # Create a cleaned version: strip timestamps and stats from raw text,
-                    # then apply paragraph-aware formatting
-                    cleaned_raw = self.strip_timestamps(self.raw_ocr_text)
-                    cleaned_raw = self.strip_statistics(cleaned_raw)
-                    # Re-split cleaned text into lines for paragraph formatting
+                    # Create a cleaned version: strip statistics-only lines from raw text
+                    # (pure noise like "90.3K Views"), then apply paragraph-aware formatting.
+                    # IMPORTANT: Timestamps are PRESERVED in formatted_ocr_text so that
+                    # formatters like format_as_quote_retweet and format_as_tweet_thread
+                    # can use them for structural detection (e.g. finding the boundary
+                    # between comment and original tweet). Each formatter strips timestamps
+                    # itself as needed.
+                    # Note: Lines like "8:44 · 04 Dec 23 · 90.3K Views" are caught by
+                    # is_statistics_line() (Pattern 3) and removed here, which is correct
+                    # since they are pure metadata with no tweet content.
+                    # We need to filter rec_boxes to match the cleaned lines. Since
+                    # strip_statistics removes entire lines, we track which original line
+                    # indices survive by comparing the cleaned output lines back to the
+                    # original lines.
+                    original_lines = self.raw_ocr_text.split("\n")
+                    
+                    cleaned_raw = self.strip_statistics(self.raw_ocr_text)
                     cleaned_lines = cleaned_raw.split("\n")
-                    self.formatted_ocr_text = self.format_text_with_paragraphs(cleaned_lines, rec_boxes)
+                    
+                    # Match cleaned lines back to original lines to filter rec_boxes.
+                    # A cleaned line is either:
+                    #   - an original line that was kept as-is
+                    #   - an original line that was removed (stat line) — skip its rec_box
+                    # We walk through both lists simultaneously to find matches.
+                    cleaned_rec_boxes = []
+                    orig_idx = 0
+                    for cleaned_line in cleaned_lines:
+                        # Skip original lines that were removed entirely
+                        while orig_idx < len(original_lines):
+                            orig_line = original_lines[orig_idx]
+                            # Check if this original line matches the cleaned line
+                            if cleaned_line == orig_line:
+                                # Found the match — keep this rec_box
+                                if orig_idx < len(rec_boxes):
+                                    cleaned_rec_boxes.append(rec_boxes[orig_idx])
+                                orig_idx += 1
+                                break
+                            # This original line was removed — skip its rec_box
+                            orig_idx += 1
+                    
+                    self.formatted_ocr_text = self.format_text_with_paragraphs(cleaned_lines, cleaned_rec_boxes)
                     
                     # Apply selected output formatting using the cleaned + formatted text
                     output_type = self.output_type_var.get()
