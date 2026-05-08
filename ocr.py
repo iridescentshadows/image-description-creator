@@ -25,6 +25,11 @@ class PaddleOCRApp:
         self.raw_ocr_text = None  # Stores the raw OCR text (newline-joined extracted lines)
         self.formatted_ocr_text = None  # Stores cleaned + paragraph-formatted OCR text
 
+        # Paragraph break sensitivity: controls how aggressively to detect paragraph breaks
+        # Default -0.1 means a gap > 90% of previous block height triggers a new paragraph.
+        # More negative = more sensitive (fewer paragraph breaks), more positive = less sensitive (more breaks).
+        self.line_height_ratio_var = tk.DoubleVar(value=-0.1)
+
         # Output type for formatting (tweet, tweet thread, etc.)
         self.output_type_var = tk.StringVar(value="tweet")
 
@@ -154,6 +159,18 @@ class PaddleOCRApp:
         self.confidence_label.pack(side=tk.LEFT)
         confidence_scale.configure(command=self.update_confidence_label)
         
+        # Paragraph break sensitivity slider
+        ttk.Label(button_frame, text="¶ Sensitivity:").pack(side=tk.LEFT, padx=(20, 5))
+        self.line_height_scale = ttk.Scale(
+            button_frame, from_=-1.0, to=1.0,
+            variable=self.line_height_ratio_var,
+            orient=tk.HORIZONTAL, length=100
+        )
+        self.line_height_scale.pack(side=tk.LEFT, padx=(0, 5))
+        self.line_height_label = ttk.Label(button_frame, text=f"{self.line_height_ratio_var.get():.2f}")
+        self.line_height_label.pack(side=tk.LEFT)
+        self.line_height_scale.configure(command=self.update_line_height_ratio)
+        
         # Status bar
         self.status_var = tk.StringVar()
         self.status_var.set("Ready - Press Ctrl+V to paste an image")
@@ -165,6 +182,13 @@ class PaddleOCRApp:
         """Update confidence label when slider moves"""
         # Fixed: Use config() instead of setText()
         self.confidence_label.config(text=f"{float(value):.2f}")
+        
+    def update_line_height_ratio(self, value):
+        """Update paragraph sensitivity label and re-format text when slider moves"""
+        self.line_height_label.config(text=f"{float(value):.2f}")
+        # Re-format the displayed text dynamically if OCR results exist
+        if self.formatted_ocr_text is not None:
+            self.reformat_display()
         
     def setup_bindings(self):
         # Bind Ctrl+V to paste from clipboard
@@ -353,7 +377,7 @@ class PaddleOCRApp:
         # but we still want to treat single bullet points as lists
         return end_index if end_index > start_index else None
 
-    def detect_paragraph_breaks(self, rec_boxes, texts, line_height_ratio=-0.1):
+    def detect_paragraph_breaks(self, rec_boxes, texts, line_height_ratio=None):
         """
         Detect whether blocks belong to same paragraph or new paragraph.
         Special handling for bullet points to keep them on separate lines.
@@ -361,12 +385,15 @@ class PaddleOCRApp:
         Args:
             rec_boxes: List of [x1, y1, x2, y2] coordinates
             texts: List of recognized text strings
-            line_height_ratio: Threshold for considering vertical gap as paragraph break
+            line_height_ratio: Threshold for considering vertical gap as paragraph break.
+                               If None, uses the value from the UI slider.
         
         Returns:
             List of integers: 0 = same line (space), 1 = new paragraph (newline),
                              2 = extra new paragraph (double newline)
         """
+        if line_height_ratio is None:
+            line_height_ratio = self.line_height_ratio_var.get()
         if not rec_boxes or len(rec_boxes) == 0:
             return [1]
         
@@ -747,7 +774,9 @@ class PaddleOCRApp:
             # "1ll90K" (digit + letters + digits + K suffix).
             # These are tokens that contain BOTH letters AND digits but don't match
             # the clean patterns above. They are almost always OCR noise, not real words.
-            elif re.match(r'^(?=.*[A-Za-z])(?=.*\d).+$', token):
+            # EXCEPTION: Tokens starting with '@' are Twitter handles (e.g. "@user·14h")
+            # and should NOT be classified as statistics noise.
+            elif re.match(r'^(?=.*[A-Za-z])(?=.*\d).+$', token) and not token.startswith('@'):
                 stat_token_count += 1
             # Otherwise it's a real word (4+ chars or contains non-alpha chars)
             else:
@@ -780,7 +809,9 @@ class PaddleOCRApp:
             if re.match(r'^[A-Za-z]\d[\d,]*[KkMmBbTt]?$', single):
                 return True
             # Jumbled alphanumeric token like "ill637" (letters + digits mixed)
-            if re.match(r'^(?=.*[A-Za-z])(?=.*\d).+$', single):
+            # EXCEPTION: Tokens starting with '@' are Twitter handles (e.g. "@user·14h")
+            # and should NOT be classified as statistics noise.
+            if re.match(r'^(?=.*[A-Za-z])(?=.*\d).+$', single) and not single.startswith('@'):
                 return True
             # Single letter (1 char, alpha only) — OCR noise on its own line
             if re.match(r'^[A-Za-z]$', single):
@@ -874,7 +905,11 @@ class PaddleOCRApp:
             # Case 3: this line might be a nickname, and the next line is @handle
             if i + 1 < len(lines):
                 next_stripped = lines[i + 1].strip()
+                # Check if next line is a standalone @handle (e.g. "@johndoe")
                 next_handle = re.match(r"^@([\w.]+)$", next_stripped)
+                # Also check if next line has an inline @handle with a short nickname
+                # prefix (e.g. "S. @MorganBarrettX" or "John Doe @johndoe")
+                next_inline_handle = re.match(r"^(.{0,50}?)@([\w.]+)", next_stripped)
                 if next_handle:
                     # Current line is a nickname, next line is the handle
                     handle = "@" + next_handle.group(1)
@@ -883,6 +918,18 @@ class PaddleOCRApp:
                     skip_next = True
                     # Also remove any stray single-character line immediately above
                     # the nickname line (e.g. "A" from OCR misreading the X.com logo).
+                    if cleaned_lines and len(cleaned_lines[-1].strip()) == 1:
+                        cleaned_lines.pop()
+                    continue
+                elif next_inline_handle:
+                    # Current line is a display name, next line has nickname + @handle
+                    # (e.g. "Morgan Barrett" followed by "S. @MorganBarrettX")
+                    handle = "@" + next_inline_handle.group(2)
+                    handles.append(handle)
+                    # Skip both the display name line and the handle line
+                    skip_next = True
+                    # Also remove any stray single-character line immediately above
+                    # the display name line (e.g. "A" from OCR misreading the X.com logo).
                     if cleaned_lines and len(cleaned_lines[-1].strip()) == 1:
                         cleaned_lines.pop()
                     continue
@@ -1527,44 +1574,159 @@ class PaddleOCRApp:
                 comment_lines = lines[:timestamp_line_idx + 1]
                 original_lines = []
         else:
-            # No timestamp found — fall back to the original double-newline split
-            handles, cleaned = self.detect_handles(text)
-            # Strip timestamps from the text before splitting
-            cleaned = self.strip_timestamps(cleaned)
-            cleaned = cleaned.strip()
+            # No timestamp found — use handle-based splitting.
+            # Strategy: find handle lines in the raw text. The LAST handle line
+            # belongs to the original author (bottom of the screenshot). Everything
+            # from that handle line onward is the original tweet section. Everything
+            # before it is the comment section (including the quote retweeter's
+            # display name at the top, which we strip).
+            #
+            # First, find all handle lines in the raw text (before any cleaning).
+            # A handle line is one that contains @username with a short nickname
+            # prefix (≤50 chars before the @).
+            handle_line_indices = []
+            handle_usernames = []
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                match = re.match(r"^(.{0,50}?)@([\w.]+)", stripped)
+                if match:
+                    handle_line_indices.append(i)
+                    handle_usernames.append("@" + match.group(2))
 
-            parts = re.split(r"\n\n+", cleaned, maxsplit=1)
-            if len(parts) >= 2:
-                original_text = parts[0].strip()
-                comment_text = parts[1].strip()
-            else:
-                mid = len(cleaned) // 2
-                split_pos = cleaned.rfind("\n\n", 0, mid)
-                if split_pos == -1:
-                    split_pos = cleaned.rfind(". ", 0, mid)
-                    if split_pos != -1:
-                        split_pos += 1
-                    else:
-                        split_pos = mid
-                original_text = cleaned[:split_pos].strip()
-                comment_text = cleaned[split_pos:].strip()
+            if len(handle_line_indices) >= 1:
+                # The LAST handle line is the original author's handle line.
+                # Everything from that line onward is the original tweet section.
+                last_handle_idx = handle_line_indices[-1]
+                original_author_handle = handle_usernames[-1]
 
-            # handles are in visual order: first = quote retweeter, last = original author
-            if len(handles) >= 2:
-                handle_a = handles[-1]  # Last = original author
-                handle_b = handles[0]   # First = quote retweeter
-            elif len(handles) == 1:
-                handle_a = "@original"
-                handle_b = handles[0]
+                # Original tweet section = from the last handle line to end
+                original_lines_raw = lines[last_handle_idx:]
+                # Comment section = from start to just before the last handle line
+                comment_lines_raw = lines[:last_handle_idx]
+
+                # If there are multiple handles, the first one is the quote retweeter
+                if len(handle_usernames) >= 2:
+                    quote_retweeter_handle = handle_usernames[0]
+                else:
+                    quote_retweeter_handle = "@unknown"
+
+                # --- Clean the COMMENT section ---
+                comment_raw = "\n".join(comment_lines_raw)
+
+                # Clean the comment section more carefully than detect_handles().
+                # detect_handles() is too aggressive — it removes any line that
+                # is followed by a line with an @handle, assuming it's a display
+                # name. But the comment may contain actual tweet content between
+                # the handle line and the timestamp.
+                #
+                # Strategy: find the first handle line in the comment section
+                # (the quote retweeter's handle), remove it and everything above
+                # it (display name fragments), and keep the rest as comment body.
+                comment_lines_list = comment_raw.split("\n")
+
+                # Find the first line that contains an @handle
+                first_handle_line_idx = None
+                for i, cl in enumerate(comment_lines_list):
+                    if re.search(r'@([\w.]+)', cl):
+                        first_handle_line_idx = i
+                        break
+
+                # Extract handles from the comment section
+                comment_handles = re.findall(r'@([\w.]+)', comment_raw)
+                comment_handles = ['@' + h for h in comment_handles]
+
+                if first_handle_line_idx is not None:
+                    # Remove the handle line and everything above it (display names)
+                    comment_body_lines = comment_lines_list[first_handle_line_idx + 1:]
+                else:
+                    # No handle line found — keep everything
+                    comment_body_lines = comment_lines_list
+
+                # Join the remaining lines as the comment body
+                comment_cleaned = "\n".join(comment_body_lines)
+
+                # Strip timestamps from the comment section.
+                # Also remove any remaining lines that contain an @handle
+                # followed by a timestamp pattern — these are embedded tweet
+                # card headers that OCR merged into the comment section.
+                # Also remove lines that contain @handles after timestamp
+                # stripping, since those are display-name + @handle combos
+                # from tweet card headers (e.g. "Olympics Jeremy @JeremyMonjo"
+                # after timestamp was stripped).
+                comment_cleaned = self.strip_timestamps(comment_cleaned)
+                comment_lines_after = comment_cleaned.split("\n")
+                comment_lines_after = [
+                    cl for cl in comment_lines_after
+                    if not self.has_twitter_timestamp(cl.strip())
+                    and not re.search(r'@\w+', cl)
+                ]
+                comment_cleaned = "\n".join(comment_lines_after)
+                comment_cleaned = comment_cleaned.strip()
+
+                # If the comment body is empty after cleaning, fall back to
+                # inline @mention stripping (preserving the text content).
+                if not comment_cleaned and comment_raw.strip():
+                    comment_cleaned = re.sub(
+                        r'@([\w.]+)',
+                        r'@/\1',
+                        comment_raw,
+                    ).strip()
+                    comment_handles = re.findall(r'@([\w.]+)', comment_raw)
+                    comment_handles = ['@' + h for h in comment_handles]
+                    comment_cleaned = self.strip_timestamps(comment_cleaned)
+                    comment_cleaned = comment_cleaned.strip()
+
+                # --- Clean the ORIGINAL TWEET section ---
+                original_raw = "\n".join(original_lines_raw)
+
+                # For the original tweet section, the first line contains the
+                # original author's display name + @handle. We need to strip
+                # just the handle prefix (display name + @handle) from the first
+                # line, keeping the tweet content that may follow on the same line.
+                #
+                # This handles the case where format_text_with_paragraphs merges
+                # the handle line with tweet content onto a single line, e.g.:
+                #   "Jimmy @Liberti... \"I'll try looking in Young & Freedman\"..."
+                #
+                # Strategy: extract the @handle from the first line, then remove
+                # everything from the start of the line up to and including the
+                # @handle (and any trailing "..."), keeping the tweet body.
+                first_line = original_lines_raw[0].strip()
+                handle_match = re.match(r"^(.{0,50}?)@([\w.]+)", first_line)
+                if handle_match:
+                    # Remove the display name + @handle prefix from the first line
+                    # The handle match ends at the end of the @handle
+                    handle_end = handle_match.end()
+                    # Also strip any trailing "..." that may follow the handle
+                    rest = first_line[handle_end:]
+                    rest = re.sub(r'^\.\.\.\s*', '', rest).strip()
+                    # Reconstruct: first line is now just the tweet body
+                    original_lines_clean = [rest] + original_lines_raw[1:]
+                else:
+                    original_lines_clean = list(original_lines_raw)
+
+                # Now join and clean the original section
+                original_cleaned = "\n".join(original_lines_clean).strip()
+
+                # Strip any remaining @handle mentions (content mentions, not poster handles)
+                # using the inline replacement approach
+                original_cleaned = re.sub(r'@([\w.]+)', r'@/\1', original_cleaned)
+                original_cleaned = self.strip_timestamps(original_cleaned)
+                original_cleaned = original_cleaned.strip()
+
+                return (
+                    f"quote retweet. the original tweet is by {original_author_handle} and says\n\n"
+                    f"> {original_cleaned}\n\n"
+                    f"{quote_retweeter_handle} then quote retweets this and says\n"
+                    f"> {comment_cleaned}"
+                )
             else:
-                handle_a = "@original"
-                handle_b = "@commenter"
-            return (
-                f"quote retweet. the original tweet is by {handle_a} and says\n\n"
-                f"> {original_text}\n\n"
-                f"{handle_b} then quote retweets this and says\n"
-                f"> {comment_text}"
-            )
+                # No timestamp and no handle lines found — treat the entire text
+                # as a single section (all content is the comment/body).
+                # Initialize comment_lines and original_lines so the fallback
+                # processing below (lines 1682+) can handle it.
+                comment_lines = lines
+                original_lines = []
 
         # Clean the extracted sections
         comment_raw = "\n".join(comment_lines)
@@ -1601,15 +1763,69 @@ class PaddleOCRApp:
             ).strip()
             comment_cleaned = comment_cleaned.strip()
         else:
-            comment_handles, comment_without_handles = self.detect_handles(comment_raw)
-            # Strip timestamps from the comment section (timestamps were used
-            # for structural splitting above, now remove them from the output)
-            comment_cleaned = self.strip_timestamps(comment_without_handles)
+            # Clean the comment section more carefully.
+            # detect_handles() is too aggressive here — it removes any line
+            # that is followed by a line with an @handle, assuming it's a
+            # display name. But in a quote-retweet comment section, the
+            # actual tweet content may appear between the handle line and
+            # the timestamp (e.g. "The season finale of every CW genre show:"
+            # followed by "Olympics Jeremy @JeremyMonjo · Feb 21").
+            #
+            # Strategy: instead of using detect_handles() which removes too
+            # much, we manually find and strip only the poster's handle line
+            # (and any display name lines above it), keeping all other content.
+            comment_lines_list = comment_raw.split("\n")
+
+            # Find the first line that contains an @handle — this is the
+            # quote retweeter's handle line (e.g. "@GrahamC47" or
+            # "Graham X1 @GrahamC47"). Everything above it is display name
+            # fragments that should be stripped.
+            first_handle_line_idx = None
+            for i, cl in enumerate(comment_lines_list):
+                if re.search(r'@([\w.]+)', cl):
+                    first_handle_line_idx = i
+                    break
+
+            # Extract handles from the comment section
+            comment_handles = re.findall(r'@([\w.]+)', comment_raw)
+            comment_handles = ['@' + h for h in comment_handles]
+
+            if first_handle_line_idx is not None:
+                # Remove the handle line and everything above it (display names)
+                comment_body_lines = comment_lines_list[first_handle_line_idx + 1:]
+            else:
+                # No handle line found — keep everything
+                comment_body_lines = comment_lines_list
+
+            # Join the remaining lines as the comment body
+            comment_cleaned = "\n".join(comment_body_lines)
+
+            # Strip timestamps from the comment section.
+            # The timestamp line (last line of the comment section) is metadata
+            # from the embedded tweet card header (e.g. "Olympics Jeremy @JeremyMonjo · Feb 21").
+            # strip_timestamps() won't remove it because it has text before the timestamp.
+            # We need to also strip lines that contain @handle + timestamp combos,
+            # since those are tweet card headers, not comment content.
+            comment_cleaned = self.strip_timestamps(comment_cleaned)
+
+            # Additionally, remove any remaining lines that contain an @handle
+            # followed by a timestamp pattern — these are embedded tweet card
+            # headers that OCR merged into the comment section.
+            # Also remove lines that contain @handles after timestamp stripping,
+            # since those are display-name + @handle combos from tweet card headers
+            # (e.g. "Olympics Jeremy @JeremyMonjo" after timestamp was stripped).
+            comment_lines_after = comment_cleaned.split("\n")
+            comment_lines_after = [
+                cl for cl in comment_lines_after
+                if not self.has_twitter_timestamp(cl.strip())
+                and not re.search(r'@\w+', cl)
+            ]
+            comment_cleaned = "\n".join(comment_lines_after)
+
             comment_cleaned = comment_cleaned.strip()
 
-            # If detect_handles() wiped out the entire comment (false positive
-            # where an @mention in the content was mistaken for a poster handle),
-            # fall back to just stripping the @mention(s) inline instead.
+            # If the comment body is empty after cleaning, fall back to
+            # inline @mention stripping (preserving the text content).
             if not comment_cleaned and comment_raw.strip():
                 comment_cleaned = re.sub(
                     r'@([\w.]+)',
@@ -1960,6 +2176,10 @@ class PaddleOCRApp:
                             # This original line was removed — skip its rec_box
                             orig_idx += 1
                     
+                    # Store cleaned data for dynamic re-formatting via the paragraph sensitivity slider
+                    self._cleaned_lines = cleaned_lines
+                    self._cleaned_rec_boxes = cleaned_rec_boxes
+                    
                     self.formatted_ocr_text = self.format_text_with_paragraphs(cleaned_lines, cleaned_rec_boxes)
                     
                     # Apply selected output formatting using the cleaned + formatted text
@@ -2021,6 +2241,38 @@ class PaddleOCRApp:
         self.text_widget.insert(1.0, full_text)
         self.status_var.set(f"Reformatted as {output_type}")
 
+    def reformat_display(self):
+        """Re-run paragraph formatting with the current line_height_ratio and re-display."""
+        if not hasattr(self, '_cleaned_lines') or not hasattr(self, '_cleaned_rec_boxes'):
+            return
+        if self._cleaned_lines is None or self._cleaned_rec_boxes is None:
+            return
+
+        # Re-format with the current slider value
+        self.formatted_ocr_text = self.format_text_with_paragraphs(
+            self._cleaned_lines, self._cleaned_rec_boxes
+        )
+
+        # Re-apply the output formatter
+        output_type = self.output_type_var.get()
+        formatter = {
+            "tweet": self.format_as_tweet,
+            "tweet thread": self.format_as_tweet_thread,
+            "quote retweet": self.format_as_quote_retweet,
+            "reddit post": self.format_as_reddit_post,
+            "reddit comment": self.format_as_reddit_comment,
+            "reddit thread": self.format_as_reddit_thread,
+        }
+        formatter_func = formatter.get(output_type, self.format_as_tweet)
+        full_text = formatter_func(self.formatted_ocr_text)
+
+        # Update the text widget
+        self.text_widget.delete(1.0, tk.END)
+        self.text_widget.insert(1.0, full_text)
+        self.status_var.set(
+            f"Paragraph sensitivity: {self.line_height_ratio_var.get():.2f}"
+        )
+
     def copy_to_clipboard(self):
         """Copy extracted text to clipboard with output formatting"""
         text = self.text_widget.get(1.0, tk.END).strip()
@@ -2054,6 +2306,8 @@ class PaddleOCRApp:
         self.current_ocr_result = None
         self.raw_ocr_text = None
         self.formatted_ocr_text = None
+        self._cleaned_lines = None
+        self._cleaned_rec_boxes = None
         self.image_label.config(image='', text="No image pasted yet\n\nPress Ctrl+V to paste an image")
         self.image_label.image = None
         self.text_widget.delete(1.0, tk.END)
